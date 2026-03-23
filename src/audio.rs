@@ -5,11 +5,11 @@ use rustfft::{num_complex::Complex, FftPlanner};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
 use symphonia::core::errors::Error as SymphoniaError;
@@ -360,11 +360,13 @@ impl AudioAnalyzer {
 
         let analysis_controller = AnalysisController::new();
         let transport_controller = TransportController::new();
+        let playback_position = Arc::new(AtomicU64::new(0));
         let playback = start_file_playback(
             file.samples.clone(),
             file.channels as usize,
             file.sample_rate,
             transport_controller.clone(),
+            playback_position.clone(),
         )?;
 
         let (mut tx, rx) = HeapRb::<FftItem>::new(64).split();
@@ -373,6 +375,7 @@ impl AudioAnalyzer {
         let shared_samples = file.samples.clone();
         let analysis_controller_for_thread = analysis_controller.clone();
         let transport_controller_for_thread = transport_controller.clone();
+        let playback_position_for_thread = playback_position.clone();
 
         thread::spawn(move || {
             loop {
@@ -383,6 +386,7 @@ impl AudioAnalyzer {
                     &analysis_controller_for_thread,
                     Some(&transport_controller_for_thread),
                     &mut tx,
+                    &playback_position_for_thread,
                 ) {
                     eprintln!("Audio file analysis failed: {}", error);
                     break;
@@ -747,6 +751,7 @@ fn start_file_playback(
     source_channels: usize,
     source_sample_rate: u32,
     transport_controller: TransportController,
+    playback_position: Arc<AtomicU64>,
 ) -> Result<cpal::Stream, String> {
     let host = cpal::default_host();
     let device = host
@@ -773,6 +778,7 @@ fn start_file_playback(
             output_sample_rate,
             state,
             transport_controller,
+            playback_position,
         ),
         cpal::SampleFormat::I16 => build_output_stream::<i16>(
             &device,
@@ -781,6 +787,7 @@ fn start_file_playback(
             output_sample_rate,
             state,
             transport_controller,
+            playback_position,
         ),
         cpal::SampleFormat::U16 => build_output_stream::<u16>(
             &device,
@@ -789,6 +796,7 @@ fn start_file_playback(
             output_sample_rate,
             state,
             transport_controller,
+            playback_position,
         ),
         _ => Err("Unsupported output sample format".to_string()),
     }?;
@@ -804,6 +812,7 @@ fn build_output_stream<T>(
     output_sample_rate: u32,
     state: Arc<Mutex<PlaybackState>>,
     transport_controller: TransportController,
+    playback_position: Arc<AtomicU64>,
 ) -> Result<cpal::Stream, String>
 where
     T: cpal::SizedSample + 'static,
@@ -812,7 +821,7 @@ where
         .build_output_stream(
             config,
             move |data: &mut [T], _: &_| {
-                fill_output_buffer(data, output_channels, output_sample_rate, &state, &transport_controller);
+                fill_output_buffer(data, output_channels, output_sample_rate, &state, &transport_controller, &playback_position);
             },
             err_fn,
             None,
@@ -826,6 +835,7 @@ fn fill_output_buffer<T>(
     output_sample_rate: u32,
     state: &Arc<Mutex<PlaybackState>>,
     transport_controller: &TransportController,
+    playback_position: &Arc<AtomicU64>,
 ) where
     T: cpal::SizedSample + 'static,
 {
@@ -873,6 +883,9 @@ fn fill_output_buffer<T>(
             state.playhead_frames -= source_frame_count as f64;
         }
     }
+
+    // Publish current playback position for analysis thread sync
+    playback_position.store(state.playhead_frames.to_bits(), Ordering::Relaxed);
 }
 
 fn convert_sample<T>(sample: f32) -> T
@@ -906,6 +919,7 @@ fn analyze_audio_samples(
     analysis_controller: &AnalysisController,
     transport_controller: Option<&TransportController>,
     tx: &mut FftProducer,
+    playback_position: &Arc<AtomicU64>,
 ) -> Result<(), String> {
     if channels == 0 || sample_rate == 0 {
         return Err("Decoded audio has invalid stream parameters".to_string());
@@ -919,7 +933,7 @@ fn analyze_audio_samples(
     let chunk_frames = 1024usize;
     let chunk_samples = chunk_frames * channels;
     let mut emitted_frames = 0u64;
-    let stream_start = Instant::now();
+    let total_frames = (samples.len() / channels.max(1)) as u64;
 
     for chunk in samples.chunks(chunk_samples.max(channels)) {
         while transport_controller.is_some_and(|controller| controller.is_paused()) {
@@ -940,10 +954,19 @@ fn analyze_audio_samples(
         );
 
         emitted_frames += (chunk.len() / channels) as u64;
-        let target_elapsed = Duration::from_secs_f64(emitted_frames as f64 / sample_rate as f64);
-        let actual_elapsed = stream_start.elapsed();
-        if target_elapsed > actual_elapsed {
-            thread::sleep(target_elapsed - actual_elapsed);
+        // Pace analysis against actual playback position (hardware audio clock)
+        loop {
+            let playback_bits = playback_position.load(Ordering::Relaxed);
+            let playback_frames = f64::from_bits(playback_bits) as u64;
+            // Allow analysis to be slightly ahead (1 chunk) but not more
+            if emitted_frames <= playback_frames + chunk_frames as u64 {
+                break;
+            }
+            // Handle wraparound: if playback wrapped past us, break
+            if total_frames > 0 && playback_frames + total_frames / 2 < emitted_frames {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
         }
     }
 

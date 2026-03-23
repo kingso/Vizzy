@@ -1,9 +1,9 @@
 use winit::{
     application::ApplicationHandler,
-    event::{ElementState, WindowEvent},
+    event::{ElementState, MouseButton, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{KeyCode, ModifiersState, PhysicalKey},
-    window::WindowId,
+    window::{Icon, WindowId},
 };
 use std::array;
 use std::cell::Cell;
@@ -22,10 +22,16 @@ mod audio;
 
 const LOG_BIN_UNIFORM_ROWS: usize = audio::LOG_BAND_COUNT / 4;
 const GRAPH_HISTORY_LENGTH: usize = 128;
+const MIN_GRAPH_HISTORY_POINTS: usize = 16;
 const GRAPH_FEATURE_COUNT: usize = 12;
 const GRAPH_NORMALIZATION_EPSILON: f32 = 1e-4;
 const GRAPH_SIGNAL_EPSILON: f32 = 0.01;
+const GRAPH_VIEW_CENTER_DEADBAND: f32 = 0.015;
+const GRAPH_VIEW_EXTENT_DEADBAND: f32 = 0.025;
+const GRAPH_VIEW_EXPAND_PADDING: f32 = 1.18;
+const GRAPH_VIEW_SHRINK_HYSTERESIS: f32 = 0.92;
 const UI_CONFIG_FILE: &str = "ui_settings.toml";
+const PANEL_SNAP_STEP: f32 = 1.0 / 28.0;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -66,6 +72,28 @@ struct StandardUniforms {
     _graph_view_padding: [f32; 2],
     graph_view_center: [f32; 3],
     graph_view_extent: f32,
+    reactivity_mode: f32,
+    peak_sub_bass: f32,
+    peak_bass: f32,
+    peak_mid: f32,
+    peak_treble: f32,
+    peak_presence: f32,
+    peak_air: f32,
+    peak_loudness: f32,
+    peak_peak: f32,
+    peak_beat: f32,
+    peak_centroid: f32,
+    graph_history_count: f32,
+    graph_offset: [f32; 2],
+    spectrum_offset: [f32; 2],
+    left_arc_offset: [f32; 2],
+    right_arc_offset: [f32; 2],
+    chart_x_offset: [f32; 2],
+    chart_y_offset: [f32; 2],
+    chart_z_offset: [f32; 2],
+    chart_s_offset: [f32; 2],
+    tuning_offset: [f32; 2],
+    axis_offset: [f32; 2],
 }
 
 #[repr(C)]
@@ -105,6 +133,39 @@ impl GraphFramingMode {
         match self {
             Self::Locality => "LOC",
             Self::Fixed => "FIX",
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum ReactivityMode {
+    Subtle,
+    Moderate,
+    Aggressive,
+}
+
+impl ReactivityMode {
+    fn next(self) -> Self {
+        match self {
+            Self::Subtle => Self::Moderate,
+            Self::Moderate => Self::Aggressive,
+            Self::Aggressive => Self::Subtle,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Subtle => "Subtle",
+            Self::Moderate => "Moderate",
+            Self::Aggressive => "Aggressive",
+        }
+    }
+
+    fn value(self) -> f32 {
+        match self {
+            Self::Subtle => 0.0,
+            Self::Moderate => 1.0,
+            Self::Aggressive => 2.0,
         }
     }
 }
@@ -232,6 +293,79 @@ impl AxisSelectionFocus {
     }
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum GraphPreset {
+    Universal,
+    Classic,
+    Rhythm,
+}
+
+impl GraphPreset {
+    const ALL: [Self; 3] = [Self::Universal, Self::Classic, Self::Rhythm];
+
+    fn next(self) -> Self {
+        match self {
+            Self::Universal => Self::Classic,
+            Self::Classic => Self::Rhythm,
+            Self::Rhythm => Self::Universal,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Universal => "UNIVERSAL",
+            Self::Classic => "CLASSIC",
+            Self::Rhythm => "RHYTHM",
+        }
+    }
+
+    fn axes(self) -> (GraphAxisSource, GraphAxisSource, GraphAxisSource, GraphAxisSource) {
+        match self {
+            Self::Universal => (
+                GraphAxisSource::Centroid,
+                GraphAxisSource::Mid,
+                GraphAxisSource::Loudness,
+                GraphAxisSource::Peak,
+            ),
+            Self::Classic => (
+                GraphAxisSource::Bass,
+                GraphAxisSource::Mid,
+                GraphAxisSource::Treble,
+                GraphAxisSource::Peak,
+            ),
+            Self::Rhythm => (
+                GraphAxisSource::Centroid,
+                GraphAxisSource::Loudness,
+                GraphAxisSource::Beat,
+                GraphAxisSource::Peak,
+            ),
+        }
+    }
+
+    fn matches(
+        self,
+        axis_x: GraphAxisSource,
+        axis_y: GraphAxisSource,
+        axis_z: GraphAxisSource,
+        axis_size: GraphAxisSource,
+    ) -> bool {
+        let (preset_x, preset_y, preset_z, preset_size) = self.axes();
+        axis_x == preset_x && axis_y == preset_y && axis_z == preset_z && axis_size == preset_size
+    }
+
+    fn current(
+        axis_x: GraphAxisSource,
+        axis_y: GraphAxisSource,
+        axis_z: GraphAxisSource,
+        axis_size: GraphAxisSource,
+    ) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|preset| preset.matches(axis_x, axis_y, axis_z, axis_size))
+    }
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum GraphNormalizationMode {
@@ -257,6 +391,38 @@ impl GraphNormalizationMode {
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(default)]
+struct LayoutSettings {
+    graph_offset: [f32; 2],
+    spectrum_offset: [f32; 2],
+    left_arc_offset: [f32; 2],
+    right_arc_offset: [f32; 2],
+    chart_x_offset: [f32; 2],
+    chart_y_offset: [f32; 2],
+    chart_z_offset: [f32; 2],
+    chart_s_offset: [f32; 2],
+    tuning_offset: [f32; 2],
+    axis_offset: [f32; 2],
+}
+
+impl Default for LayoutSettings {
+    fn default() -> Self {
+        Self {
+            graph_offset: [0.0, 0.0],
+            spectrum_offset: [0.017857108, 0.038571477],
+            left_arc_offset: [-0.008812599, -0.1657143],
+            right_arc_offset: [-0.13000898, -0.1657143],
+            chart_x_offset: [-0.1273661, -0.15142861],
+            chart_y_offset: [-0.1273661, -0.1464286],
+            chart_z_offset: [-0.1273661, -0.14142856],
+            chart_s_offset: [-0.1273661, -0.13642853],
+            tuning_offset: [0.51350886, 0.0585714],
+            axis_offset: [0.0, 0.0],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(default)]
 struct UiSettings {
     axis_x_source: GraphAxisSource,
     axis_y_source: GraphAxisSource,
@@ -266,21 +432,51 @@ struct UiSettings {
     graph_framing_mode: GraphFramingMode,
     graph_fixed_center: [f32; 3],
     graph_fixed_extent: f32,
+    graph_history_points: usize,
+    layout: LayoutSettings,
 }
 
 impl Default for UiSettings {
     fn default() -> Self {
         Self {
-            axis_x_source: GraphAxisSource::Bass,
-            axis_y_source: GraphAxisSource::Beat,
-            axis_z_source: GraphAxisSource::Centroid,
-            axis_size_source: GraphAxisSource::Peak,
-            graph_normalization_mode: GraphNormalizationMode::Absolute,
+            axis_x_source: GraphAxisSource::Loudness,
+            axis_y_source: GraphAxisSource::Presence,
+            axis_z_source: GraphAxisSource::Mid,
+            axis_size_source: GraphAxisSource::SubBass,
+            graph_normalization_mode: GraphNormalizationMode::Normalized,
             graph_framing_mode: GraphFramingMode::Locality,
             graph_fixed_center: [0.5, 0.5, 0.5],
             graph_fixed_extent: 0.5,
+            graph_history_points: GRAPH_HISTORY_LENGTH,
+            layout: LayoutSettings::default(),
         }
     }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum PointerInteraction {
+    DragPanel,
+    HistorySlider,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum DragTarget {
+    Graph,
+    Spectrum,
+    LeftArc,
+    RightArc,
+    ChartX,
+    ChartY,
+    ChartZ,
+    ChartS,
+    Tuning,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct PanelRect {
+    target: DragTarget,
+    center: [f32; 2],
+    half: [f32; 2],
 }
 
 fn ui_settings_path() -> Option<PathBuf> {
@@ -445,6 +641,7 @@ struct App {
     bind_group_layout: Option<wgpu::BindGroupLayout>,
     bind_group: Option<wgpu::BindGroup>,
     start_time: Option<Instant>,
+    last_frame_time: Option<Instant>,
     last_title_refresh: Cell<Option<Instant>>,
     current_sub_bass: f32,
     current_bass: f32,
@@ -456,6 +653,16 @@ struct App {
     current_peak: f32,
     current_beat: f32,
     current_centroid: f32,
+    peak_sub_bass: f32,
+    peak_bass: f32,
+    peak_mid: f32,
+    peak_treble: f32,
+    peak_presence: f32,
+    peak_air: f32,
+    peak_loudness: f32,
+    peak_peak: f32,
+    peak_beat: f32,
+    peak_centroid: f32,
     loudness_history: VecDeque<f32>,
     feature_history: VecDeque<[f32; GRAPH_FEATURE_COUNT]>,
     current_log_bins: [f32; audio::LOG_BAND_COUNT],
@@ -465,6 +672,7 @@ struct App {
     audio_loading_stage: String,
     audio_loading_error: Option<String>,
     beat_response_mode: BeatResponseMode,
+    reactivity_mode: ReactivityMode,
     tuning_focus: TuningFocus,
     axis_focus: AxisSelectionFocus,
     axis_x_source: GraphAxisSource,
@@ -475,6 +683,12 @@ struct App {
     graph_framing_mode: GraphFramingMode,
     graph_view_state: GraphViewState,
     graph_fixed_view: GraphViewState,
+    graph_history_points: usize,
+    layout: LayoutSettings,
+    cursor_world: Option<[f32; 2]>,
+    active_drag: Option<DragTarget>,
+    pointer_interaction: Option<PointerInteraction>,
+    drag_grab_offset: [f32; 2],
     modifiers: ModifiersState,
     show_shortcuts: bool,
     shader_hot_reload: ShaderHotReload,
@@ -485,6 +699,13 @@ fn shader_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("src")
         .join("shader.wgsl")
+}
+
+fn load_window_icon() -> Option<Icon> {
+    let icon_bytes = include_bytes!(concat!(env!("OUT_DIR"), "/vizzy-icon-256.png"));
+    let image = image::load_from_memory(icon_bytes).ok()?.into_rgba8();
+    let (width, height) = image.dimensions();
+    Icon::from_rgba(image.into_raw(), width, height).ok()
 }
 
 fn read_shader_source(path: &Path) -> Result<(String, SystemTime), String> {
@@ -568,11 +789,17 @@ fn build_graph_history_uniforms(
     axis_z: GraphAxisSource,
     size_source: GraphAxisSource,
     normalization_mode: GraphNormalizationMode,
+    visible_points: usize,
 ) -> GraphHistoryUniforms {
     let mut points = [[0.0, 0.0, 0.0, -1.0]; GRAPH_HISTORY_LENGTH];
 
-    for (index, sample) in history.iter().enumerate().take(GRAPH_HISTORY_LENGTH) {
-        points[index] = [
+    let clamped_visible_points = visible_points.clamp(MIN_GRAPH_HISTORY_POINTS, GRAPH_HISTORY_LENGTH);
+    let available_points = history.len().min(clamped_visible_points);
+    let history_start = history.len().saturating_sub(available_points);
+    let buffer_start = GRAPH_HISTORY_LENGTH - available_points;
+
+    for (index, sample) in history.iter().skip(history_start).take(available_points).enumerate() {
+        points[buffer_start + index] = [
             feature_value_for_axis(sample, axis_x),
             feature_value_for_axis(sample, axis_y),
             feature_value_for_axis(sample, axis_z),
@@ -670,11 +897,24 @@ fn should_capture_graph_sample(
         .any(|axis| feature_value_for_axis(sample, axis) > GRAPH_SIGNAL_EPSILON)
 }
 
-fn smooth_graph_view_towards(current: &mut GraphViewState, target: GraphViewState) {
+fn smooth_graph_view_towards(current: &mut GraphViewState, target: GraphViewState, dt: f32) {
+    let padded_target_extent = (target.extent * GRAPH_VIEW_EXPAND_PADDING)
+        .max(GRAPH_NORMALIZATION_EPSILON)
+        .min(1.5);
+
     for axis in 0..3 {
-        envelope_follow(&mut current.center[axis], target.center[axis], 0.10, 0.08);
+        let delta = target.center[axis] - current.center[axis];
+        if delta.abs() > GRAPH_VIEW_CENTER_DEADBAND {
+            envelope_follow(&mut current.center[axis], target.center[axis], 0.07, 0.05, dt);
+        }
     }
-    envelope_follow(&mut current.extent, target.extent, 0.08, 0.06);
+
+    let extent_delta = padded_target_extent - current.extent;
+    if extent_delta > GRAPH_VIEW_EXTENT_DEADBAND {
+        envelope_follow(&mut current.extent, padded_target_extent, 0.06, 0.06, dt);
+    } else if padded_target_extent < current.extent * GRAPH_VIEW_SHRINK_HYSTERESIS {
+        envelope_follow(&mut current.extent, padded_target_extent, 0.02, 0.02, dt);
+    }
 }
 
 fn graph_view_control_multiplier(modifiers: ModifiersState) -> f32 {
@@ -685,6 +925,63 @@ fn graph_view_control_multiplier(modifiers: ModifiersState) -> f32 {
     } else {
         1.0
     }
+}
+
+fn base_panel_rects(aspect: f32) -> Vec<PanelRect> {
+    let margin = 0.05;
+    let graph_half = [aspect * 0.5 - margin, 0.94];
+    let graph_center = [aspect * 0.5, 0.0];
+    let left_edge = graph_center[0] - graph_half[0] - margin;
+    let left_cx = (-aspect + left_edge) * 0.5;
+    let left_hx = (left_edge + aspect) * 0.5 - margin * 0.5;
+    let left_min = left_cx - left_hx;
+    let left_max = left_cx + left_hx;
+
+    let spec_center = [left_cx, 0.64];
+    let spec_half = [left_hx, 0.28];
+
+    let charts_gap = margin * 0.28;
+    let charts_hx = 0.32;
+    let charts_center_x = left_max - charts_hx;
+    let arc_region_max = charts_center_x - charts_hx - charts_gap;
+    let arc_region_center_x = (left_min + arc_region_max) * 0.5;
+    let arc_region_hx = (arc_region_max - left_min) * 0.5;
+    let arc_gap = margin * 0.10;
+    let arc_hx = arc_region_hx * 0.5 - arc_gap * 0.5;
+    let arc_hy = 0.64;
+    let arc_cy = -0.12;
+    let left_arc_cx = arc_region_center_x - (arc_hx + arc_gap * 0.5);
+    let right_arc_cx = arc_region_center_x + (arc_hx + arc_gap * 0.5);
+
+    let chart_half = [charts_hx, 0.105];
+    let chart_gap = 0.035;
+    let chart_step = chart_half[1] * 2.0 + chart_gap;
+    let chart_base_y = -0.42;
+
+    vec![
+        PanelRect { target: DragTarget::Graph, center: graph_center, half: graph_half },
+        PanelRect { target: DragTarget::Spectrum, center: spec_center, half: spec_half },
+        PanelRect { target: DragTarget::LeftArc, center: [left_arc_cx, arc_cy], half: [arc_hx, arc_hy] },
+        PanelRect { target: DragTarget::RightArc, center: [right_arc_cx, arc_cy], half: [arc_hx, arc_hy] },
+        PanelRect { target: DragTarget::ChartX, center: [charts_center_x, chart_base_y], half: chart_half },
+        PanelRect { target: DragTarget::ChartY, center: [charts_center_x, chart_base_y + chart_step], half: chart_half },
+        PanelRect { target: DragTarget::ChartZ, center: [charts_center_x, chart_base_y + chart_step * 2.0], half: chart_half },
+        PanelRect { target: DragTarget::ChartS, center: [charts_center_x, chart_base_y + chart_step * 3.0], half: chart_half },
+        PanelRect { target: DragTarget::Tuning, center: [left_arc_cx, -0.88], half: [0.32, 0.125] },
+    ]
+}
+
+fn cursor_to_world(cursor_x: f64, cursor_y: f64, width: u32, height: u32) -> [f32; 2] {
+    let safe_width = width.max(1) as f32;
+    let safe_height = height.max(1) as f32;
+    let aspect = safe_width / safe_height;
+    let ndc_x = (cursor_x as f32 / safe_width) * 2.0 - 1.0;
+    let ndc_y = (cursor_y as f32 / safe_height) * 2.0 - 1.0;
+    [ndc_x * aspect, ndc_y]
+}
+
+fn snap_to_grid(value: f32, step: f32) -> f32 {
+    (value / step).round() * step
 }
 
 fn build_feature_snapshot(
@@ -905,6 +1202,7 @@ impl App {
             bind_group_layout: None,
             bind_group: None,
             start_time: None,
+            last_frame_time: None,
             last_title_refresh: Cell::new(None),
             current_sub_bass: 0.0,
             current_bass: 0.0,
@@ -916,6 +1214,16 @@ impl App {
             current_peak: 0.0,
             current_beat: 0.0,
             current_centroid: 0.0,
+            peak_sub_bass: 0.0,
+            peak_bass: 0.0,
+            peak_mid: 0.0,
+            peak_treble: 0.0,
+            peak_presence: 0.0,
+            peak_air: 0.0,
+            peak_loudness: 0.0,
+            peak_peak: 0.0,
+            peak_beat: 0.0,
+            peak_centroid: 0.0,
             loudness_history: VecDeque::with_capacity(48),
             feature_history: VecDeque::with_capacity(GRAPH_HISTORY_LENGTH),
             current_log_bins: [0.0; audio::LOG_BAND_COUNT],
@@ -925,6 +1233,7 @@ impl App {
             audio_loading_stage: "Waiting to load audio".to_string(),
             audio_loading_error: None,
             beat_response_mode: BeatResponseMode::Balanced,
+            reactivity_mode: ReactivityMode::Moderate,
             tuning_focus: TuningFocus::RmsThreshold,
             axis_focus: AxisSelectionFocus::X,
             axis_x_source: ui_settings.axis_x_source,
@@ -941,6 +1250,14 @@ impl App {
                 center: ui_settings.graph_fixed_center,
                 extent: ui_settings.graph_fixed_extent,
             },
+            graph_history_points: ui_settings
+                .graph_history_points
+                .clamp(MIN_GRAPH_HISTORY_POINTS, GRAPH_HISTORY_LENGTH),
+            layout: ui_settings.layout,
+            cursor_world: None,
+            active_drag: None,
+            pointer_interaction: None,
+            drag_grab_offset: [0.0, 0.0],
             modifiers: ModifiersState::empty(),
             show_shortcuts: false,
             shader_hot_reload: ShaderHotReload {
@@ -965,10 +1282,14 @@ impl App {
                     tuning_step_value(self.tuning_focus, self.modifiers),
                 )
             }).unwrap_or_default();
+            let preset_label = self.current_graph_preset()
+                .map_or("CUSTOM", GraphPreset::label);
             let graph_suffix = format!(
-                " | Graph {} {} | X {} Y {} Z {} S {}",
+                " | Graph {} {} Preset {} Hist {} | X {} Y {} Z {} S {}",
                 self.graph_normalization_mode.label(),
                 self.graph_framing_mode.label(),
+                preset_label,
+                self.graph_history_points,
                 self.axis_x_source.label(),
                 self.axis_y_source.label(),
                 self.axis_z_source.label(),
@@ -981,8 +1302,9 @@ impl App {
             };
             let title = if let Some(error) = &self.audio_loading_error {
                 format!(
-                    "Vizzy Diagnostics | Audio Error | Beat {} | {} | {}{}{}{}",
+                    "Vizzy Diagnostics | Audio Error | Beat {} Rx {} | {} | {}{}{}{}",
                     self.beat_response_mode.label(),
+                    self.reactivity_mode.label(),
                     source_label(&self.audio_source),
                     error,
                     tuning_suffix,
@@ -991,16 +1313,19 @@ impl App {
                 )
             } else if self.show_shortcuts {
                 format!(
-                    "Vizzy Shortcuts | H help | Space play/pause | Tab target | [ ] tune | X/Y/Z/S axis | Arrows map | N norm | F frame | PgUp/PgDn zoom | IJKL/UO pan | Shift coarse | Ctrl fine | 0 reset | 1 beat mode{}{}{}",
+                    "Vizzy | H close help | P next preset | Beat {} Rx {}{}{}{}",
+                    self.beat_response_mode.label(),
+                    self.reactivity_mode.label(),
                     tuning_suffix,
                     transport_suffix,
                     graph_suffix,
                 )
             } else if self.audio_analyzer.is_none() {
                 format!(
-                    "Vizzy Diagnostics | Loading {:.0}% | Beat {} | {} | {}{}{}{}",
+                    "Vizzy Diagnostics | Loading {:.0}% | Beat {} Rx {} | {} | {}{}{}{}",
                     self.audio_loading_progress * 100.0,
                     self.beat_response_mode.label(),
+                    self.reactivity_mode.label(),
                     self.audio_loading_stage,
                     source_label(&self.audio_source),
                     tuning_suffix,
@@ -1009,21 +1334,22 @@ impl App {
                 )
             } else {
                 format!(
-                    "Vizzy Diagnostics | Beat {} | {} | SB {:.2} B {:.2} M {:.2} T {:.2} Pr {:.2} Air {:.2} L {:.2} P {:.2} Bt {:.2} C {:.2}{}{}{}",
+                    "Vizzy Diagnostics | Beat {} Rx {} | {} | SB {:.2} B {:.2} M {:.2} T {:.2} Pr {:.2} Air {:.2} L {:.2} P {:.2} Bt {:.2} C {:.2}{}{}{}",
                     self.beat_response_mode.label(),
+                    self.reactivity_mode.label(),
                     source_label(&self.audio_source),
                     self.current_sub_bass,
                     self.current_bass,
                     self.current_mid,
                     self.current_treble,
                     self.current_presence,
-                    self.current_centroid,
-                    tuning_suffix,
-                    transport_suffix,
+                    self.current_air,
                     self.current_loudness,
                     self.current_peak,
                     self.current_beat,
                     self.current_centroid,
+                    tuning_suffix,
+                    transport_suffix,
                     graph_suffix,
                 )
             };
@@ -1111,7 +1437,212 @@ impl App {
             graph_framing_mode: self.graph_framing_mode,
             graph_fixed_center: self.graph_fixed_view.center,
             graph_fixed_extent: self.graph_fixed_view.extent,
+            graph_history_points: self.graph_history_points,
+            layout: self.layout,
         });
+    }
+
+    fn current_graph_preset(&self) -> Option<GraphPreset> {
+        GraphPreset::current(
+            self.axis_x_source,
+            self.axis_y_source,
+            self.axis_z_source,
+            self.axis_size_source,
+        )
+    }
+
+    fn apply_graph_preset(&mut self, preset: GraphPreset) {
+        let (axis_x_source, axis_y_source, axis_z_source, axis_size_source) = preset.axes();
+        self.axis_x_source = axis_x_source;
+        self.axis_y_source = axis_y_source;
+        self.axis_z_source = axis_z_source;
+        self.axis_size_source = axis_size_source;
+        self.save_axis_settings();
+        self.signal_status([0.94, 0.56, 0.22]);
+        self.refresh_window_title();
+    }
+
+    fn cycle_graph_preset(&mut self) {
+        let next_preset = self
+            .current_graph_preset()
+            .map_or(GraphPreset::Universal, GraphPreset::next);
+        self.apply_graph_preset(next_preset);
+    }
+
+    fn reset_view_layout(&mut self) {
+        self.layout = LayoutSettings::default();
+        self.graph_fixed_view = GraphViewState {
+            center: [0.5, 0.5, 0.5],
+            extent: 0.5,
+        };
+        self.graph_view_state = self.graph_fixed_view;
+        self.save_axis_settings();
+        self.signal_status([0.94, 0.74, 0.18]);
+        self.refresh_window_title();
+    }
+
+    fn panel_offset(&self, target: DragTarget) -> [f32; 2] {
+        match target {
+            DragTarget::Graph => self.layout.graph_offset,
+            DragTarget::Spectrum => self.layout.spectrum_offset,
+            DragTarget::LeftArc => self.layout.left_arc_offset,
+            DragTarget::RightArc => self.layout.right_arc_offset,
+            DragTarget::ChartX => self.layout.chart_x_offset,
+            DragTarget::ChartY => self.layout.chart_y_offset,
+            DragTarget::ChartZ => self.layout.chart_z_offset,
+            DragTarget::ChartS => self.layout.chart_s_offset,
+            DragTarget::Tuning => self.layout.tuning_offset,
+        }
+    }
+
+    fn panel_offset_mut(&mut self, target: DragTarget) -> &mut [f32; 2] {
+        match target {
+            DragTarget::Graph => &mut self.layout.graph_offset,
+            DragTarget::Spectrum => &mut self.layout.spectrum_offset,
+            DragTarget::LeftArc => &mut self.layout.left_arc_offset,
+            DragTarget::RightArc => &mut self.layout.right_arc_offset,
+            DragTarget::ChartX => &mut self.layout.chart_x_offset,
+            DragTarget::ChartY => &mut self.layout.chart_y_offset,
+            DragTarget::ChartZ => &mut self.layout.chart_z_offset,
+            DragTarget::ChartS => &mut self.layout.chart_s_offset,
+            DragTarget::Tuning => &mut self.layout.tuning_offset,
+        }
+    }
+
+    fn panel_rects(&self, aspect: f32) -> Vec<PanelRect> {
+        base_panel_rects(aspect)
+            .into_iter()
+            .map(|mut rect| {
+                let offset = self.panel_offset(rect.target);
+                rect.center[0] += offset[0] * aspect;
+                rect.center[1] += offset[1];
+                rect
+            })
+            .collect()
+    }
+
+    fn history_slider_rect(&self, aspect: f32) -> ([f32; 2], [f32; 2]) {
+        let tuning_rect = self
+            .panel_rects(aspect)
+            .into_iter()
+            .find(|rect| rect.target == DragTarget::Tuning)
+            .unwrap_or(PanelRect {
+                target: DragTarget::Tuning,
+                center: [0.0, 0.0],
+                half: [0.32, 0.125],
+            });
+
+        (
+            [
+                tuning_rect.center[0] + tuning_rect.half[0] * 0.12,
+                tuning_rect.center[1] + tuning_rect.half[1] * 0.42,
+            ],
+            [tuning_rect.half[0] * 0.72, 0.012],
+        )
+    }
+
+    fn update_graph_history_points_from_cursor(&mut self) {
+        let (Some(cursor), Some(config)) = (self.cursor_world, self.config.as_ref()) else {
+            return;
+        };
+
+        let aspect = config.width as f32 / config.height.max(1) as f32;
+        let (slider_center, slider_half) = self.history_slider_rect(aspect);
+        let min_x = slider_center[0] - slider_half[0];
+        let max_x = slider_center[0] + slider_half[0];
+        let t = ((cursor[0] - min_x) / (max_x - min_x).max(1e-5)).clamp(0.0, 1.0);
+        let span = (GRAPH_HISTORY_LENGTH - MIN_GRAPH_HISTORY_POINTS) as f32;
+        let next_points = (MIN_GRAPH_HISTORY_POINTS as f32 + t * span).round() as usize;
+        let clamped_points = next_points.clamp(MIN_GRAPH_HISTORY_POINTS, GRAPH_HISTORY_LENGTH);
+        if clamped_points != self.graph_history_points {
+            self.graph_history_points = clamped_points;
+            self.signal_status([0.34, 0.86, 0.98]);
+            self.refresh_window_title();
+        }
+    }
+
+    fn begin_drag(&mut self) {
+        let (Some(cursor), Some(config)) = (self.cursor_world, self.config.as_ref()) else {
+            return;
+        };
+
+        self.pointer_interaction = None;
+        self.active_drag = None;
+        let aspect = config.width as f32 / config.height.max(1) as f32;
+        let (slider_center, slider_half) = self.history_slider_rect(aspect);
+        if (cursor[0] - slider_center[0]).abs() <= slider_half[0]
+            && (cursor[1] - slider_center[1]).abs() <= slider_half[1] * 2.5
+        {
+            self.pointer_interaction = Some(PointerInteraction::HistorySlider);
+            self.active_drag = None;
+            self.update_graph_history_points_from_cursor();
+            return;
+        }
+
+        for rect in self.panel_rects(aspect).into_iter().rev() {
+            if (cursor[0] - rect.center[0]).abs() <= rect.half[0]
+                && (cursor[1] - rect.center[1]).abs() <= rect.half[1]
+            {
+                self.pointer_interaction = Some(PointerInteraction::DragPanel);
+                self.active_drag = Some(rect.target);
+                self.drag_grab_offset = [cursor[0] - rect.center[0], cursor[1] - rect.center[1]];
+                break;
+            }
+        }
+    }
+
+    fn update_drag(&mut self) {
+        if self.pointer_interaction == Some(PointerInteraction::HistorySlider) {
+            self.update_graph_history_points_from_cursor();
+            return;
+        }
+
+        let (Some(target), Some(cursor), Some(config)) =
+            (self.active_drag, self.cursor_world, self.config.as_ref())
+        else {
+            return;
+        };
+
+        let aspect = config.width as f32 / config.height.max(1) as f32;
+        let Some(base_rect) = base_panel_rects(aspect).into_iter().find(|rect| rect.target == target) else {
+            return;
+        };
+
+        let unclamped_center = [
+            cursor[0] - self.drag_grab_offset[0],
+            cursor[1] - self.drag_grab_offset[1],
+        ];
+        let clamped_center = [
+            unclamped_center[0].clamp(-aspect + base_rect.half[0], aspect - base_rect.half[0]),
+            unclamped_center[1].clamp(-1.0 + base_rect.half[1], 1.0 - base_rect.half[1]),
+        ];
+        let snapped_center = [
+            snap_to_grid(clamped_center[0], PANEL_SNAP_STEP)
+                .clamp(-aspect + base_rect.half[0], aspect - base_rect.half[0]),
+            snap_to_grid(clamped_center[1], PANEL_SNAP_STEP)
+                .clamp(-1.0 + base_rect.half[1], 1.0 - base_rect.half[1]),
+        ];
+        let offset = [
+            (snapped_center[0] - base_rect.center[0]) / aspect.max(1e-4),
+            snapped_center[1] - base_rect.center[1],
+        ];
+        *self.panel_offset_mut(target) = offset;
+    }
+
+    fn end_drag(&mut self) {
+        if self.pointer_interaction == Some(PointerInteraction::HistorySlider) {
+            self.pointer_interaction = None;
+            self.save_axis_settings();
+            self.refresh_window_title();
+            return;
+        }
+
+        if self.active_drag.take().is_some() {
+            self.pointer_interaction = None;
+            self.save_axis_settings();
+            self.signal_status([0.34, 0.86, 0.98]);
+            self.refresh_window_title();
+        }
     }
 
     fn cycle_axis_mapping(&mut self, next: bool) {
@@ -1352,7 +1883,8 @@ impl ApplicationHandler for App {
         if self.window.is_none() {
             let window_attr = winit::window::WindowAttributes::default()
                 .with_title("Vizzy Audio Visualizer")
-                .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0));
+                .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0))
+                .with_window_icon(load_window_icon());
             
             let window = Arc::new(event_loop.create_window(window_attr).unwrap());
             self.window = Some(window.clone());
@@ -1442,9 +1974,31 @@ impl ApplicationHandler for App {
                 _graph_view_padding: [0.0; 2],
                 graph_view_center: self.graph_view_state.center,
                 graph_view_extent: self.graph_view_state.extent,
+                reactivity_mode: self.reactivity_mode.value(),
+                peak_sub_bass: 0.0,
+                peak_bass: 0.0,
+                peak_mid: 0.0,
+                peak_treble: 0.0,
+                peak_presence: 0.0,
+                peak_air: 0.0,
+                peak_loudness: 0.0,
+                peak_peak: 0.0,
+                peak_beat: 0.0,
+                peak_centroid: 0.0,
+                graph_history_count: self.graph_history_points as f32,
+                graph_offset: self.layout.graph_offset,
+                spectrum_offset: self.layout.spectrum_offset,
+                left_arc_offset: self.layout.left_arc_offset,
+                right_arc_offset: self.layout.right_arc_offset,
+                chart_x_offset: self.layout.chart_x_offset,
+                chart_y_offset: self.layout.chart_y_offset,
+                chart_z_offset: self.layout.chart_z_offset,
+                chart_s_offset: self.layout.chart_s_offset,
+                tuning_offset: self.layout.tuning_offset,
+                axis_offset: self.layout.axis_offset,
             };
 
-            debug_assert_eq!(std::mem::size_of::<StandardUniforms>(), 176);
+            debug_assert_eq!(std::mem::size_of::<StandardUniforms>(), 304);
 
             let uniform_buffer = device.create_buffer_init(
                 &wgpu::util::BufferInitDescriptor {
@@ -1469,6 +2023,7 @@ impl ApplicationHandler for App {
                 self.axis_z_source,
                 self.axis_size_source,
                 self.graph_normalization_mode,
+                self.graph_history_points,
             );
             self.graph_view_state = build_graph_view_state(&initial_graph_history.points);
 
@@ -1542,6 +2097,20 @@ impl ApplicationHandler for App {
                 self.modifiers = modifiers.state();
                 self.refresh_window_title_if_due(std::time::Duration::from_millis(250));
             }
+            WindowEvent::CursorMoved { position, .. } => {
+                if let Some(config) = &self.config {
+                    self.cursor_world = Some(cursor_to_world(position.x, position.y, config.width, config.height));
+                    self.update_drag();
+                    window.request_redraw();
+                }
+            }
+            WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
+                match state {
+                    ElementState::Pressed => self.begin_drag(),
+                    ElementState::Released => self.end_drag(),
+                }
+                window.request_redraw();
+            }
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == ElementState::Pressed && !event.repeat {
                     if let PhysicalKey::Code(code) = event.physical_key {
@@ -1550,11 +2119,17 @@ impl ApplicationHandler for App {
                                 self.beat_response_mode = self.beat_response_mode.next();
                                 self.refresh_window_title();
                             }
+                            KeyCode::KeyR => {
+                                self.reactivity_mode = self.reactivity_mode.next();
+                                self.signal_status([0.22, 0.80, 0.96]);
+                                self.refresh_window_title();
+                            }
                             KeyCode::KeyH => {
                                 self.show_shortcuts = !self.show_shortcuts;
                                 self.signal_status([0.30, 0.70, 1.00]);
                                 self.refresh_window_title();
                             }
+                            KeyCode::KeyP => self.cycle_graph_preset(),
                             KeyCode::Space => self.toggle_play_pause(),
                             KeyCode::KeyX => self.set_axis_focus(AxisSelectionFocus::X),
                             KeyCode::KeyY => self.set_axis_focus(AxisSelectionFocus::Y),
@@ -1582,10 +2157,21 @@ impl ApplicationHandler for App {
                             KeyCode::Digit0 => {
                                 if let Some(controller) = &self.analysis_controller {
                                     controller.reset();
+                                    self.peak_sub_bass = 0.0;
+                                    self.peak_bass = 0.0;
+                                    self.peak_mid = 0.0;
+                                    self.peak_treble = 0.0;
+                                    self.peak_presence = 0.0;
+                                    self.peak_air = 0.0;
+                                    self.peak_loudness = 0.0;
+                                    self.peak_peak = 0.0;
+                                    self.peak_beat = 0.0;
+                                    self.peak_centroid = 0.0;
                                     self.signal_status([0.94, 0.74, 0.18]);
                                     self.refresh_window_title();
                                 }
                             }
+                            KeyCode::Digit9 => self.reset_view_layout(),
                             _ => {}
                         }
                     }
@@ -1627,7 +2213,7 @@ impl ApplicationHandler for App {
                 let mut target_air = self.current_air;
                 let mut target_loudness = self.current_loudness;
                 let mut target_peak = self.current_peak;
-                let mut target_beat = 0.0;
+                let mut target_beat = self.current_beat;
                 let mut target_centroid = self.current_centroid;
                 let mut target_log_bins = self.current_log_bins;
                 let mut received_audio_update = false;
@@ -1690,22 +2276,52 @@ impl ApplicationHandler for App {
                             self.loudness_history.pop_front();
                         }
                         self.loudness_history.push_back(average_loudness);
+                    } else {
+                        // When no audio is received, decay all signals to zero
+                        target_sub_bass = 0.0;
+                        target_bass = 0.0;
+                        target_mid = 0.0;
+                        target_treble = 0.0;
+                        target_presence = 0.0;
+                        target_air = 0.0;
+                        target_loudness = 0.0;
+                        target_peak = 0.0;
+                        target_beat = 0.0;
+                        target_centroid = 0.0;
+                        target_log_bins = array::from_fn(|_| 0.0);
                     }
                 }
 
-                envelope_follow(&mut self.current_sub_bass, target_sub_bass, 0.16, 0.050);
-                envelope_follow(&mut self.current_bass, target_bass, 0.14, 0.045);
-                envelope_follow(&mut self.current_mid, target_mid, 0.12, 0.050);
-                envelope_follow(&mut self.current_treble, target_treble, 0.16, 0.070);
-                envelope_follow(&mut self.current_presence, target_presence, 0.16, 0.080);
-                envelope_follow(&mut self.current_air, target_air, 0.18, 0.090);
-                envelope_follow(&mut self.current_loudness, target_loudness, 0.12, 0.040);
-                envelope_follow(&mut self.current_peak, target_peak, 0.18, 0.090);
+                // Frame-rate independent delta time
+                let now = Instant::now();
+                let dt = self.last_frame_time.map_or(1.0 / 60.0, |last| now.duration_since(last).as_secs_f32());
+                self.last_frame_time = Some(now);
+                let dt_clamped = dt.clamp(0.001, 0.1); // guard against spikes
+
+                envelope_follow(&mut self.current_sub_bass, target_sub_bass, 0.16, 0.050, dt_clamped);
+                envelope_follow(&mut self.current_bass, target_bass, 0.14, 0.045, dt_clamped);
+                envelope_follow(&mut self.current_mid, target_mid, 0.12, 0.050, dt_clamped);
+                envelope_follow(&mut self.current_treble, target_treble, 0.16, 0.070, dt_clamped);
+                envelope_follow(&mut self.current_presence, target_presence, 0.16, 0.080, dt_clamped);
+                envelope_follow(&mut self.current_air, target_air, 0.18, 0.090, dt_clamped);
+                envelope_follow(&mut self.current_loudness, target_loudness, 0.12, 0.040, dt_clamped);
+                envelope_follow(&mut self.current_peak, target_peak, 0.18, 0.090, dt_clamped);
                 let (beat_attack, beat_release) = self.beat_response_mode.envelope();
-                envelope_follow(&mut self.current_beat, target_beat, beat_attack, beat_release);
-                envelope_follow(&mut self.current_centroid, target_centroid, 0.10, 0.050);
+                envelope_follow(&mut self.current_beat, target_beat, beat_attack, beat_release, dt_clamped);
+                envelope_follow(&mut self.current_centroid, target_centroid, 0.10, 0.050, dt_clamped);
+                // Update peak tracking
+                self.peak_sub_bass = self.peak_sub_bass.max(self.current_sub_bass);
+                self.peak_bass = self.peak_bass.max(self.current_bass);
+                self.peak_mid = self.peak_mid.max(self.current_mid);
+                self.peak_treble = self.peak_treble.max(self.current_treble);
+                self.peak_presence = self.peak_presence.max(self.current_presence);
+                self.peak_air = self.peak_air.max(self.current_air);
+                self.peak_loudness = self.peak_loudness.max(self.current_loudness);
+                self.peak_peak = self.peak_peak.max(self.current_peak);
+                self.peak_beat = self.peak_beat.max(self.current_beat);
+                self.peak_centroid = self.peak_centroid.max(self.current_centroid);
                 for (current_bin, target_bin) in self.current_log_bins.iter_mut().zip(target_log_bins.iter()) {
-                    envelope_follow(current_bin, *target_bin, 0.18, 0.080);
+                    envelope_follow(current_bin, *target_bin, 0.18, 0.080, dt_clamped);
                 }
 
                 // Clamp audio values to sane range for shader stability
@@ -1762,13 +2378,14 @@ impl ApplicationHandler for App {
                     self.axis_z_source,
                     self.axis_size_source,
                     self.graph_normalization_mode,
+                    self.graph_history_points,
                 );
                 let graph_view = build_graph_view_state(&graph_history_uniforms.points);
                 let active_graph_view = if self.graph_framing_mode == GraphFramingMode::Locality {
-                    smooth_graph_view_towards(&mut self.graph_view_state, graph_view);
+                    smooth_graph_view_towards(&mut self.graph_view_state, graph_view, dt_clamped);
                     self.graph_view_state
                 } else {
-                    smooth_graph_view_towards(&mut self.graph_view_state, self.graph_fixed_view);
+                    smooth_graph_view_towards(&mut self.graph_view_state, self.graph_fixed_view, dt_clamped);
                     self.graph_view_state
                 };
 
@@ -1818,6 +2435,28 @@ impl ApplicationHandler for App {
                     _graph_view_padding: [0.0; 2],
                     graph_view_center: active_graph_view.center,
                     graph_view_extent: active_graph_view.extent,
+                    reactivity_mode: self.reactivity_mode.value(),
+                    peak_sub_bass: self.peak_sub_bass.clamp(0.0, 1.0),
+                    peak_bass: self.peak_bass.clamp(0.0, 1.0),
+                    peak_mid: self.peak_mid.clamp(0.0, 1.0),
+                    peak_treble: self.peak_treble.clamp(0.0, 1.0),
+                    peak_presence: self.peak_presence.clamp(0.0, 1.0),
+                    peak_air: self.peak_air.clamp(0.0, 1.0),
+                    peak_loudness: self.peak_loudness.clamp(0.0, 1.0),
+                    peak_peak: self.peak_peak.clamp(0.0, 1.0),
+                    peak_beat: self.peak_beat.clamp(0.0, 1.0),
+                    peak_centroid: self.peak_centroid.clamp(0.0, 1.0),
+                    graph_history_count: self.graph_history_points as f32,
+                    graph_offset: self.layout.graph_offset,
+                    spectrum_offset: self.layout.spectrum_offset,
+                    left_arc_offset: self.layout.left_arc_offset,
+                    right_arc_offset: self.layout.right_arc_offset,
+                    chart_x_offset: self.layout.chart_x_offset,
+                    chart_y_offset: self.layout.chart_y_offset,
+                    chart_z_offset: self.layout.chart_z_offset,
+                    chart_s_offset: self.layout.chart_s_offset,
+                    tuning_offset: self.layout.tuning_offset,
+                    axis_offset: self.layout.axis_offset,
                 };
 
                 queue.write_buffer(
@@ -1893,9 +2532,13 @@ impl ApplicationHandler for App {
 }
 
 /// Envelope follower: attack and release rates in the [0, 1] range.
-fn envelope_follow(curr: &mut f32, target: f32, attack: f32, release: f32) {
+/// dt-normalized so behavior is consistent across frame rates.
+/// Rates are tuned for 60fps baseline.
+fn envelope_follow(curr: &mut f32, target: f32, attack: f32, release: f32, dt: f32) {
     let rate = if target > *curr { attack } else { release };
-    *curr += (target - *curr) * rate;
+    // Normalize to 60fps: at dt=1/60, factor = rate. At higher fps, factor is smaller.
+    let factor = 1.0 - (1.0 - rate).powf(dt * 60.0);
+    *curr += (target - *curr) * factor;
 }
 
 fn main() {

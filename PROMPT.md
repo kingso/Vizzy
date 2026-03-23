@@ -36,6 +36,8 @@ Source selection rules:
 The app exposes a lightweight runtime control through the window title bar:
 - pressing `1` cycles beat response mode through `Smooth`, `Balanced`, and `Tight`
 - this changes beat-detection sensitivity and beat-envelope smoothing
+- pressing `P` cycles graph presets through `Universal`, `Classic`, and `Rhythm`
+- each preset updates the graph's X/Y/Z/size feature assignments to a recommended combination
 
 ## Core Architecture
 
