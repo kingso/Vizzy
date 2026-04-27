@@ -98,18 +98,19 @@ fn reactivity_scale() -> f32 {
 }
 
 fn background(uv: vec2<f32>) -> vec3<f32> {
-    let horizon = step(-0.5, uv.y);
-    let base = mix(vec3<f32>(0.010, 0.016, 0.032), vec3<f32>(0.030, 0.045, 0.080), horizon);
+    let aspect = uniforms.resolution.x / uniforms.resolution.y;
+    let stage_uv = vec2<f32>(uv.x / max(aspect, 1e-4), uv.y);
+    let base = mix(vec3<f32>(0.014, 0.014, 0.016), vec3<f32>(0.030, 0.030, 0.034), smoothstep(-0.18, 0.95, uv.y));
+    let overhead = exp(-length(vec2<f32>(stage_uv.x * 2.2, (uv.y + 0.98) * 2.9)) * 4.6);
+    let floor_shape = vec2<f32>(stage_uv.x * 2.8, (uv.y - 0.72) * 4.2);
+    let floor_glow = exp(-dot(floor_shape, floor_shape) * 1.8);
+    let vignette = smoothstep(0.45, 1.15, length(vec2<f32>(stage_uv.x * 1.2, uv.y * 0.95)));
+
     var color = base;
-
-    // hexagonal grid
-    let hex_scale = 28.0;
-    let hx = uv * hex_scale;
-    let hr = fract(hx) - 0.5;
-    let hex_dist = max(abs(hr.x) * 0.866 + abs(hr.y) * 0.5, abs(hr.y));
-    let hex_line = step(0.48, hex_dist);
-    color += vec3<f32>(0.06, 0.14, 0.22) * hex_line * 0.06;
-
+    color += vec3<f32>(0.070, 0.070, 0.076) * overhead * 0.55;
+    color += vec3<f32>(0.155, 0.156, 0.162) * floor_glow * 0.34;
+    color *= 1.0 - vignette * 0.58;
+    color += vec3<f32>(0.020, 0.020, 0.024) * floor_glow * 0.28;
     return color;
 }
 
@@ -125,19 +126,16 @@ fn holographic_panel(uv: vec2<f32>, center: vec2<f32>, half_size: vec2<f32>, tin
     let inner = rounded_box(uv, center, half_size - vec2<f32>(0.012, 0.012), 0.012);
     let border = max(outer - inner, 0.0);
 
-    // chromatic aberration at edges
     let edge_dist = length((uv - center) / half_size);
-    let aberration = step(0.85, edge_dist) * 0.3;
+    let aberration = step(0.90, edge_dist) * 0.08;
     let r_shift = rounded_box(uv + vec2<f32>(0.003, 0.0) * aberration, center, half_size - vec2<f32>(0.012, 0.012), 0.012);
     let b_shift = rounded_box(uv - vec2<f32>(0.003, 0.0) * aberration, center, half_size - vec2<f32>(0.012, 0.012), 0.012);
 
-    // sweep effect along border
-    let sweep = 0.55 + 0.45 * sin((uv.y + center.x * 0.5) * 25.0 - uniforms.time * 1.15);
+    let sweep = 0.62 + 0.18 * sin((uv.y + center.x * 0.35) * 18.0 - uniforms.time * 0.65);
 
-    var color = tint * border * (0.50 + sweep * 0.50);
-    // chromatic edge tint
-    color.r += tint.r * max(outer - r_shift, 0.0) * aberration * 0.5;
-    color.b += tint.b * max(outer - b_shift, 0.0) * aberration * 0.5;
+    var color = tint * border * (0.26 + sweep * 0.24);
+    color.r += tint.r * max(outer - r_shift, 0.0) * aberration * 0.18;
+    color.b += tint.b * max(outer - b_shift, 0.0) * aberration * 0.18;
     return color;
 }
 
@@ -170,7 +168,7 @@ fn hud_corner(uv: vec2<f32>, corner: vec2<f32>, size: f32, tint: vec3<f32>) -> v
 }
 
 fn hud_corners(uv: vec2<f32>) -> vec3<f32> {
-    let tint = vec3<f32>(0.22, 0.78, 0.96);
+    let tint = vec3<f32>(0.20, 0.21, 0.24);
     let inset = 0.06;
     let arm_size = 0.14;
     let aspect = uniforms.resolution.x / uniforms.resolution.y;
@@ -307,17 +305,24 @@ fn progress_bar(uv: vec2<f32>) -> vec3<f32> {
         return vec3<f32>(0.0);
     }
 
-    let frame = rounded_box(uv, vec2<f32>(0.0, 0.77), vec2<f32>(0.58, 0.075), 0.018);
-    let lane = rounded_box(uv, vec2<f32>(0.0, 0.77), vec2<f32>(0.53, 0.034), 0.012);
-    let fill_width = 0.53 * clamp(uniforms.loading_progress, 0.0, 1.0);
-    let fill_center_x = -0.52 + fill_width;
-    let fill = rounded_box(uv, vec2<f32>(fill_center_x, 0.77), vec2<f32>(fill_width, 0.034), 0.012);
-    let chrome = holographic_panel(uv, vec2<f32>(0.0, 0.77), vec2<f32>(0.58, 0.075), vec3<f32>(0.32, 0.78, 0.98));
+    let aspect = uniforms.resolution.x / uniforms.resolution.y;
+    let frame_center = vec2<f32>(0.0, 0.92);
+    let frame_half = vec2<f32>(aspect - 0.08, 0.045);
+    let lane_half = frame_half - vec2<f32>(0.08, 0.016);
+    let frame = rounded_box(uv, frame_center, frame_half, 0.018);
+    let lane = rounded_box(uv, frame_center, lane_half, 0.012);
+    let progress = clamp(uniforms.loading_progress, 0.0, 1.0);
+    let fill_half_x = lane_half.x * progress;
+    let fill_center_x = frame_center.x - lane_half.x + fill_half_x;
+    let chrome = holographic_panel(uv, frame_center, frame_half, vec3<f32>(0.34, 0.36, 0.40));
 
     var color = vec3<f32>(0.0);
-    color += vec3<f32>(0.05, 0.08, 0.12) * frame;
-    color += vec3<f32>(0.03, 0.05, 0.08) * lane;
-    color += vec3<f32>(0.18, 0.86, 0.96) * fill;
+    color += vec3<f32>(0.028, 0.029, 0.032) * frame;
+    color += vec3<f32>(0.016, 0.017, 0.020) * lane;
+    if fill_half_x > 0.0005 {
+        let fill = rounded_box(uv, vec2<f32>(fill_center_x, frame_center.y), vec2<f32>(fill_half_x, lane_half.y), 0.012);
+        color += vec3<f32>(0.62, 0.66, 0.72) * fill;
+    }
     color += chrome;
     return color;
 }
@@ -376,12 +381,15 @@ fn status_badge(uv: vec2<f32>) -> vec3<f32> {
         return vec3<f32>(0.0);
     }
 
-    let badge = rounded_box(uv, vec2<f32>(-0.78, -0.82), vec2<f32>(0.14, 0.05), 0.016);
+    let aspect = uniforms.resolution.x / uniforms.resolution.y;
+    let badge_center = vec2<f32>(-aspect + 0.20, 0.92);
+    let badge_half = vec2<f32>(0.14, 0.05);
+    let badge = rounded_box(uv, badge_center, badge_half, 0.016);
     let color = uniforms.status_color.xyz;
 
     var indicator = vec3<f32>(0.05, 0.06, 0.08) * badge;
     indicator += color * badge * (0.24 + alpha * 0.45);
-    indicator += holographic_panel(uv, vec2<f32>(-0.78, -0.82), vec2<f32>(0.14, 0.05), color);
+    indicator += holographic_panel(uv, badge_center, badge_half, color);
     return indicator;
 }
 
@@ -820,12 +828,23 @@ fn glyph_sample(ch: u32, rel: vec2<f32>) -> f32 {
     return f32(bit);
 }
 
+fn glyph_sample_filtered(ch: u32, rel: vec2<f32>) -> f32 {
+    let dx = 0.42 / 5.0;
+    let dy = 0.42 / 7.0;
+    let coverage = glyph_sample(ch, rel) * 0.40
+        + glyph_sample(ch, rel + vec2<f32>(-dx, -dy)) * 0.15
+        + glyph_sample(ch, rel + vec2<f32>(dx, -dy)) * 0.15
+        + glyph_sample(ch, rel + vec2<f32>(-dx, dy)) * 0.15
+        + glyph_sample(ch, rel + vec2<f32>(dx, dy)) * 0.15;
+    return smoothstep(0.18, 0.78, coverage);
+}
+
 fn draw_char(uv: vec2<f32>, top_left: vec2<f32>, char_size: vec2<f32>, ch: u32, tint: vec3<f32>) -> vec3<f32> {
     let rel = vec2<f32>(
         (uv.x - top_left.x) / char_size.x,
         (uv.y - top_left.y) / char_size.y,
     );
-    let mask = glyph_sample(ch, rel);
+    let mask = glyph_sample_filtered(ch, rel);
     return tint * mask;
 }
 
@@ -1056,7 +1075,7 @@ fn draw_text_line(
 }
 
 fn tuning_hud(uv: vec2<f32>) -> vec3<f32> {
-    let panel_half = vec2<f32>(0.32, 0.125);
+    let panel_half = vec2<f32>(0.34, 0.125);
     let panel = rounded_box(uv, vec2<f32>(0.0, 0.0), panel_half, 0.012);
     let focus = u32(round(uniforms.active_tuning_focus));
     let is_hz = uniforms.active_tuning_is_hz > 0.5;
@@ -1434,12 +1453,12 @@ fn visible_graph_history_t(index: u32) -> f32 {
 fn graph_edge(uv: vec2<f32>, start: vec3<f32>, end: vec3<f32>, tint: vec3<f32>) -> vec3<f32> {
     let a = project_graph_point(start);
     let b = project_graph_point(end);
-    let line = step(distance_to_segment(uv, a, b), 0.006);
-    return tint * line * 0.12;
+    let line = step(distance_to_segment(uv, a, b), 0.0035);
+    return tint * line * 0.08;
 }
 
 fn graph_wireframe(uv: vec2<f32>) -> vec3<f32> {
-    let tint = vec3<f32>(0.18, 0.40, 0.58);
+    let tint = vec3<f32>(0.28, 0.30, 0.34);
     let min_point = graph_view_min();
     let max_point = graph_view_max();
     let p000 = vec3<f32>(min_point.x, min_point.y, min_point.z);
@@ -1482,24 +1501,22 @@ fn graph_trace(uv: vec2<f32>) -> vec3<f32> {
         let projected_previous = project_graph_point(previous.xyz);
         let projected_current = project_graph_point(current.xyz);
         let distance = distance_to_segment(uv, projected_previous, projected_current);
-        // variable width based on size and recency
-        let line_width = 1.0 / (mix(320.0, 200.0, size) * mix(1.0, 0.6, age));
+        let line_width = 1.0 / (mix(560.0, 420.0, size) * mix(1.0, 0.82, age));
         let line = step(distance, line_width);
-        let tint = mix(vec3<f32>(0.16, 0.84, 0.96), vec3<f32>(0.98, 0.46, 0.22), age);
-        color += tint * line * (0.40 + age * 0.50);
-        let dot_radius = 1.0 / mix(100.0, 40.0, size);
-        color += tint * step(length(uv - projected_current), dot_radius) * (0.16 + size * 0.28);
+        let tint = mix(vec3<f32>(0.46, 0.47, 0.50), vec3<f32>(0.70, 0.72, 0.76), age * 0.55 + rx * 0.08);
+        color += tint * line * (0.18 + age * 0.16);
+        let dot_radius = 1.0 / mix(170.0, 95.0, size);
+        color += vec3<f32>(0.82, 0.84, 0.88) * step(length(uv - projected_current), dot_radius) * (0.05 + size * 0.09);
     }
     return color;
 }
 
 fn graph_panel(uv: vec2<f32>) -> vec3<f32> {
     let panel = rounded_box(uv, vec2<f32>(0.0, 0.0), vec2<f32>(0.98, 0.98), 0.000);
-    var color = vec3<f32>(0.025, 0.040, 0.070) * panel;
-    color += holographic_panel(uv, vec2<f32>(0.0, 0.0), vec2<f32>(0.98, 0.98), vec3<f32>(0.24, 0.72, 0.98));
-    // subtle grid pulse
+    var color = vec3<f32>(0.022, 0.023, 0.028) * panel;
+    color += holographic_panel(uv, vec2<f32>(0.0, 0.0), vec2<f32>(0.98, 0.98), vec3<f32>(0.34, 0.36, 0.40));
     let grid_pulse = 0.5 + 0.5 * sin(uniforms.time * 0.3);
-    color += graph_wireframe(uv) * (0.8 + grid_pulse * 0.2);
+    color += graph_wireframe(uv) * (0.52 + grid_pulse * 0.08);
     color += graph_trace(uv);
     color += graph_axis_labels(uv);
     return color * panel;
@@ -1984,61 +2001,52 @@ fn dashboard(uv: vec2<f32>) -> vec3<f32> {
     let aspect = uniforms.resolution.x / uniforms.resolution.y;
     let margin = 0.05;
 
-    // background
     var color = background(uv);
 
-    // === RIGHT: 3D Graph (square, centered vertically) ===
-    let graph_half = vec2<f32>(aspect * 0.5 - margin, 0.94);
-    let graph_center = vec2<f32>(aspect * 0.5, 0.0) + layout_offset(uniforms.graph_offset);
+    let graph_half = vec2<f32>(aspect * 0.5 - margin * 1.2, 0.84);
+    let graph_center = vec2<f32>(aspect - margin - graph_half.x, 0.0) + layout_offset(uniforms.graph_offset);
     let graph_mask = rounded_box(uv, graph_center, graph_half, 0.020);
     let graph_uv = (uv - graph_center) / graph_half;
     color += graph_panel(graph_uv) * graph_mask;
 
-    // Left panel width = space to the left of the graph
-    let left_edge = graph_center.x - graph_half.x - margin;
-    let left_cx = (-aspect + left_edge) * 0.5;
-    let left_hx = (left_edge + aspect) * 0.5 - margin * 0.5;
-    let left_min = left_cx - left_hx;
-    let left_max = left_cx + left_hx;
+    let left_min = -aspect + margin;
+    let left_max = graph_center.x - graph_half.x - margin;
+    let left_cx = (left_min + left_max) * 0.5;
+    let left_hx = (left_max - left_min) * 0.5;
 
-    // === LEFT TOP: Spectrum strip ===
-    let spec_center = vec2<f32>(left_cx, 0.64) + layout_offset(uniforms.spectrum_offset);
-    let spec_half = vec2<f32>(left_hx, 0.28);
-    let spec_mask = rounded_box(uv, spec_center, spec_half, 0.018);
-    let spec_uv = (uv - spec_center) / spec_half;
-    color += spectrum_strip(spec_uv) * spec_mask;
+    let stack_hx = 0.34;
+    let stack_center_x = left_max - stack_hx;
+    let stack_gap = 0.035;
+    let chart_half = vec2<f32>(stack_hx, 0.080);
+    let chart_step = chart_half.y * 2.0 + stack_gap;
+    let tuning_pos = vec2<f32>(stack_center_x, -0.78) + layout_offset(uniforms.tuning_offset);
 
-    // === LEFT MID: Arc gauges hard-left, XYZS history charts in a vertical column ===
-    let charts_gap = margin * 0.28;
-    let charts_hx = 0.32;
-    let charts_center_x = left_max - charts_hx;
-    let arc_region_max = charts_center_x - charts_hx - charts_gap;
-    let arc_region_center_x = (left_min + arc_region_max) * 0.5;
-    let arc_region_hx = (arc_region_max - left_min) * 0.5;
-    let arc_gap = margin * 0.10;
-    let arc_hx = arc_region_hx * 0.5 - arc_gap * 0.5;
-    let arc_hy = 0.64;
-    let arc_cy = -0.12;
+    let arc_region_max = stack_center_x - stack_hx - margin * 0.8;
+    let arc_gap = margin * 0.24;
+    let arc_hx = min(max(((arc_region_max - left_min) - arc_gap) * 0.25, 0.10), 0.16);
+    let arc_hy = 0.46;
+    let arc_cy = -0.32;
     let arc_panel_half = vec2<f32>(arc_hx, arc_hy);
 
-    let left_arc_cx = arc_region_center_x - (arc_hx + arc_gap * 0.5);
+    let arc_center_base = (left_min + arc_region_max) * 0.5;
+    let left_arc_cx = arc_center_base - (arc_hx + arc_gap * 0.5);
     let left_arc_center = vec2<f32>(left_arc_cx, arc_cy) + layout_offset(uniforms.left_arc_offset);
     let left_arc_mask = rounded_box(uv, left_arc_center, arc_panel_half, 0.018);
     let left_arc_uv = (uv - left_arc_center) / arc_panel_half;
     color += left_arc_gauges(left_arc_uv, arc_panel_half) * left_arc_mask;
 
-    let right_arc_cx = arc_region_center_x + (arc_hx + arc_gap * 0.5);
+    let right_arc_cx = arc_center_base + (arc_hx + arc_gap * 0.5);
     let right_arc_center = vec2<f32>(right_arc_cx, arc_cy) + layout_offset(uniforms.right_arc_offset);
     let right_arc_mask = rounded_box(uv, right_arc_center, arc_panel_half, 0.018);
     let right_arc_uv = (uv - right_arc_center) / arc_panel_half;
     color += right_arc_gauges(right_arc_uv, arc_panel_half) * right_arc_mask;
 
-    let chart_half = vec2<f32>(charts_hx, 0.105);
-    let chart_gap = 0.035;
-    let chart_center_0 = vec2<f32>(charts_center_x, -0.42) + layout_offset(uniforms.chart_x_offset);
-    let chart_center_1 = vec2<f32>(charts_center_x, -0.42 + (chart_half.y * 2.0 + chart_gap)) + layout_offset(uniforms.chart_y_offset);
-    let chart_center_2 = vec2<f32>(charts_center_x, -0.42 + (chart_half.y * 2.0 + chart_gap) * 2.0) + layout_offset(uniforms.chart_z_offset);
-    let chart_center_3 = vec2<f32>(charts_center_x, -0.42 + (chart_half.y * 2.0 + chart_gap) * 3.0) + layout_offset(uniforms.chart_s_offset);
+    color += tuning_hud(uv - tuning_pos);
+
+    let chart_center_0 = vec2<f32>(stack_center_x, -0.46) + layout_offset(uniforms.chart_x_offset);
+    let chart_center_1 = vec2<f32>(stack_center_x, -0.46 + chart_step) + layout_offset(uniforms.chart_y_offset);
+    let chart_center_2 = vec2<f32>(stack_center_x, -0.46 + chart_step * 2.0) + layout_offset(uniforms.chart_z_offset);
+    let chart_center_3 = vec2<f32>(stack_center_x, -0.46 + chart_step * 3.0) + layout_offset(uniforms.chart_s_offset);
 
     let chart_mask_0 = rounded_box(uv, chart_center_0, chart_half, 0.018);
     let chart_uv_0 = (uv - chart_center_0) / chart_half;
@@ -2056,24 +2064,22 @@ fn dashboard(uv: vec2<f32>) -> vec3<f32> {
     let chart_uv_3 = (uv - chart_center_3) / chart_half;
     color += history_chart_panel(chart_uv_3, 3u, 83u, vec3<f32>(0.96, 0.42, 0.72)) * chart_mask_3;
 
-    // === LEFT BOTTOM: Controls ===
-    let ctrl_y = -0.88;
-    let tuning_pos = vec2<f32>(left_arc_cx, ctrl_y) + layout_offset(uniforms.tuning_offset);
-    color += tuning_hud(uv - tuning_pos);
+    let spec_center = vec2<f32>(left_cx, 0.56) + layout_offset(uniforms.spectrum_offset);
+    let spec_half = vec2<f32>(left_hx, 0.26);
+    let spec_mask = rounded_box(uv, spec_center, spec_half, 0.018);
+    let spec_uv = (uv - spec_center) / spec_half;
+    color += spectrum_strip(spec_uv) * spec_mask;
+
     color += progress_bar(uv);
     color += status_badge(uv);
-
-    // HUD corner decorations
     color += hud_corners(uv);
 
-    // help overlay panel
     if uniforms.show_help > 0.5 {
         color = mix(color, color * 0.3, 0.5);
         color += help_panel(uv);
     }
 
-    // tone curve
-    color = pow(clamp(color, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(0.92));
+    color = pow(clamp(color, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(0.94));
     return color;
 }
 

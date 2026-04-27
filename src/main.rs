@@ -31,6 +31,7 @@ const GRAPH_VIEW_EXTENT_DEADBAND: f32 = 0.025;
 const GRAPH_VIEW_EXPAND_PADDING: f32 = 1.18;
 const GRAPH_VIEW_SHRINK_HYSTERESIS: f32 = 0.92;
 const UI_CONFIG_FILE: &str = "ui_settings.toml";
+const UI_LAYOUT_VERSION: u32 = 2;
 const PANEL_SNAP_STEP: f32 = 1.0 / 28.0;
 
 #[repr(C)]
@@ -408,14 +409,14 @@ impl Default for LayoutSettings {
     fn default() -> Self {
         Self {
             graph_offset: [0.0, 0.0],
-            spectrum_offset: [0.017857108, 0.038571477],
-            left_arc_offset: [-0.008812599, -0.1657143],
-            right_arc_offset: [-0.13000898, -0.1657143],
-            chart_x_offset: [-0.1273661, -0.15142861],
-            chart_y_offset: [-0.1273661, -0.1464286],
-            chart_z_offset: [-0.1273661, -0.14142856],
-            chart_s_offset: [-0.1273661, -0.13642853],
-            tuning_offset: [0.51350886, 0.0585714],
+            spectrum_offset: [0.0, 0.0],
+            left_arc_offset: [0.0, 0.0],
+            right_arc_offset: [0.0, 0.0],
+            chart_x_offset: [0.0, 0.0],
+            chart_y_offset: [0.0, 0.0],
+            chart_z_offset: [0.0, 0.0],
+            chart_s_offset: [0.0, 0.0],
+            tuning_offset: [0.0, 0.0],
             axis_offset: [0.0, 0.0],
         }
     }
@@ -424,6 +425,7 @@ impl Default for LayoutSettings {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(default)]
 struct UiSettings {
+    layout_version: Option<u32>,
     axis_x_source: GraphAxisSource,
     axis_y_source: GraphAxisSource,
     axis_z_source: GraphAxisSource,
@@ -439,6 +441,7 @@ struct UiSettings {
 impl Default for UiSettings {
     fn default() -> Self {
         Self {
+            layout_version: Some(UI_LAYOUT_VERSION),
             axis_x_source: GraphAxisSource::Loudness,
             axis_y_source: GraphAxisSource::Presence,
             axis_z_source: GraphAxisSource::Mid,
@@ -488,10 +491,17 @@ fn load_ui_settings() -> UiSettings {
         return UiSettings::default();
     };
 
-    fs::read_to_string(&path)
+    let mut settings: UiSettings = fs::read_to_string(&path)
         .ok()
         .and_then(|contents| toml::from_str(&contents).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+
+    if settings.layout_version != Some(UI_LAYOUT_VERSION) {
+        settings.layout = LayoutSettings::default();
+        settings.layout_version = Some(UI_LAYOUT_VERSION);
+    }
+
+    settings
 }
 
 fn save_ui_settings(settings: &UiSettings) {
@@ -929,45 +939,44 @@ fn graph_view_control_multiplier(modifiers: ModifiersState) -> f32 {
 
 fn base_panel_rects(aspect: f32) -> Vec<PanelRect> {
     let margin = 0.05;
-    let graph_half = [aspect * 0.5 - margin, 0.94];
-    let graph_center = [aspect * 0.5, 0.0];
-    let left_edge = graph_center[0] - graph_half[0] - margin;
-    let left_cx = (-aspect + left_edge) * 0.5;
-    let left_hx = (left_edge + aspect) * 0.5 - margin * 0.5;
-    let left_min = left_cx - left_hx;
-    let left_max = left_cx + left_hx;
+    let graph_half = [aspect * 0.5 - margin * 1.2, 0.84];
+    let graph_center = [aspect - margin - graph_half[0], 0.0];
+    let left_min = -aspect + margin;
+    let left_max = graph_center[0] - graph_half[0] - margin;
+    let left_cx = (left_min + left_max) * 0.5;
+    let left_hx = (left_max - left_min) * 0.5;
 
-    let spec_center = [left_cx, 0.64];
-    let spec_half = [left_hx, 0.28];
+    let spec_center = [left_cx, 0.56];
+    let spec_half = [left_hx, 0.26];
 
-    let charts_gap = margin * 0.28;
-    let charts_hx = 0.32;
-    let charts_center_x = left_max - charts_hx;
-    let arc_region_max = charts_center_x - charts_hx - charts_gap;
-    let arc_region_center_x = (left_min + arc_region_max) * 0.5;
-    let arc_region_hx = (arc_region_max - left_min) * 0.5;
-    let arc_gap = margin * 0.10;
-    let arc_hx = arc_region_hx * 0.5 - arc_gap * 0.5;
-    let arc_hy = 0.64;
-    let arc_cy = -0.12;
-    let left_arc_cx = arc_region_center_x - (arc_hx + arc_gap * 0.5);
-    let right_arc_cx = arc_region_center_x + (arc_hx + arc_gap * 0.5);
+    let stack_hx = 0.34;
+    let stack_center_x = left_max - stack_hx;
+    let stack_gap = 0.035;
+    let chart_half = [stack_hx, 0.080];
+    let chart_step = chart_half[1] * 2.0 + stack_gap;
+    let tuning_half = [stack_hx, 0.125];
+    let tuning_center_y = -0.78;
+    let chart_base_y = -0.46;
 
-    let chart_half = [charts_hx, 0.105];
-    let chart_gap = 0.035;
-    let chart_step = chart_half[1] * 2.0 + chart_gap;
-    let chart_base_y = -0.42;
+    let arc_region_max = stack_center_x - stack_hx - margin * 0.8;
+    let arc_gap = margin * 0.24;
+    let arc_hx = (((arc_region_max - left_min) - arc_gap).max(0.40) * 0.25).min(0.16);
+    let arc_hy = 0.46;
+    let arc_cy = -0.32;
+    let arc_center_base = (left_min + arc_region_max) * 0.5;
+    let left_arc_cx = arc_center_base - (arc_hx + arc_gap * 0.5);
+    let right_arc_cx = arc_center_base + (arc_hx + arc_gap * 0.5);
 
     vec![
         PanelRect { target: DragTarget::Graph, center: graph_center, half: graph_half },
-        PanelRect { target: DragTarget::Spectrum, center: spec_center, half: spec_half },
         PanelRect { target: DragTarget::LeftArc, center: [left_arc_cx, arc_cy], half: [arc_hx, arc_hy] },
         PanelRect { target: DragTarget::RightArc, center: [right_arc_cx, arc_cy], half: [arc_hx, arc_hy] },
-        PanelRect { target: DragTarget::ChartX, center: [charts_center_x, chart_base_y], half: chart_half },
-        PanelRect { target: DragTarget::ChartY, center: [charts_center_x, chart_base_y + chart_step], half: chart_half },
-        PanelRect { target: DragTarget::ChartZ, center: [charts_center_x, chart_base_y + chart_step * 2.0], half: chart_half },
-        PanelRect { target: DragTarget::ChartS, center: [charts_center_x, chart_base_y + chart_step * 3.0], half: chart_half },
-        PanelRect { target: DragTarget::Tuning, center: [left_arc_cx, -0.88], half: [0.32, 0.125] },
+        PanelRect { target: DragTarget::Tuning, center: [stack_center_x, tuning_center_y], half: tuning_half },
+        PanelRect { target: DragTarget::ChartX, center: [stack_center_x, chart_base_y], half: chart_half },
+        PanelRect { target: DragTarget::ChartY, center: [stack_center_x, chart_base_y + chart_step], half: chart_half },
+        PanelRect { target: DragTarget::ChartZ, center: [stack_center_x, chart_base_y + chart_step * 2.0], half: chart_half },
+        PanelRect { target: DragTarget::ChartS, center: [stack_center_x, chart_base_y + chart_step * 3.0], half: chart_half },
+        PanelRect { target: DragTarget::Spectrum, center: spec_center, half: spec_half },
     ]
 }
 
@@ -1429,6 +1438,7 @@ impl App {
 
     fn save_axis_settings(&self) {
         save_ui_settings(&UiSettings {
+            layout_version: Some(UI_LAYOUT_VERSION),
             axis_x_source: self.axis_x_source,
             axis_y_source: self.axis_y_source,
             axis_z_source: self.axis_z_source,
@@ -1529,7 +1539,7 @@ impl App {
             .unwrap_or(PanelRect {
                 target: DragTarget::Tuning,
                 center: [0.0, 0.0],
-                half: [0.32, 0.125],
+                half: [0.34, 0.125],
             });
 
         (
